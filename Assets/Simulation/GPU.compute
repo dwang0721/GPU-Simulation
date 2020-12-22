@@ -1,0 +1,197 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+// Learning reference: https://www.reddit.com/r/Unity3D/comments/7ppldz/physics_simulation_on_gpu_with_compute_shader_in/
+
+// same struct 
+struct HairNode
+{
+    float x, y;
+    float vx, vy;
+    int ax, ay;
+    float dummy1, dummy2;
+};
+
+struct ColliderNode
+{
+    float x, y, r;
+    int ax, ay;
+    int dummy1, dummy2, dummy3;
+};
+
+int nNodesPerHair;
+int nHairs;
+int nColliders;
+float nodeDistance;
+float dPosition;    // speed ratio for euler method
+float dVelocity;    // force ratio for euler method
+float forceDecay;
+float velocityDecay;
+float gravity;
+float stiffness;
+float maxTravelDistance;
+float bendingStiffness;
+
+int floatToInt;
+float intToFloat; 
+
+// one dimentional array
+RWStructuredBuffer<HairNode> hairNodeBuffer; 
+RWStructuredBuffer<ColliderNode> colliderBuffer;
+
+#pragma kernel ForceKernel
+[numthreads(32,32,1)]
+void ForceKernel(uint3 id : SV_DispatchThreadID)
+{
+    // We do not count the last node in one hair.
+    if (id.x >= nHairs || id.y >= nNodesPerHair - 1) 
+    {
+        return;
+    }
+
+    // find the nodes from the buffer
+    int currIndex = id.x * nNodesPerHair + id.y;
+    HairNode curr = hairNodeBuffer[currIndex];
+    HairNode next = hairNodeBuffer[currIndex + 1];
+
+    // calculate the distance
+    float2 currNext = float2(next.x - curr.x, next.y - curr.y);
+    float currDist = length(currNext);
+
+    // Hooke’s Law, a = -k * delta_x
+    float dX = clamp( nodeDistance - currDist, -maxTravelDistance, maxTravelDistance);
+    float2 springForce = -stiffness * normalize(currNext) * dX;
+
+    // Bending force, perpendicular to the tangent. 
+    float2 bendingForce = float2(0.0f, 0.0f);
+    if (id.y != 0)
+    {
+        HairNode prev = hairNodeBuffer[currIndex - 1];
+        float2 currPrev = float2(prev.x - curr.x, prev.y - curr.y);
+        bendingForce = bendingStiffness * (currNext + currPrev);
+
+        // update previous node force
+        InterlockedAdd(hairNodeBuffer[currIndex - 1].ax, -(int)(floatToInt * 0.5 * bendingForce.x));
+        InterlockedAdd(hairNodeBuffer[currIndex - 1].ay, -(int)(floatToInt * 0.5 * bendingForce.y));
+    }
+
+    // update current node force, also adding gravity to the y direction.
+    InterlockedAdd(hairNodeBuffer[currIndex].ax, (int)(floatToInt * (springForce.x + bendingForce.x)));
+    InterlockedAdd(hairNodeBuffer[currIndex].ay, (int)(floatToInt * (springForce.y + bendingForce.y - gravity)));
+    
+    // update next node force
+    InterlockedAdd(hairNodeBuffer[currIndex + 1].ax, (int)(floatToInt * ( -springForce.x - 0.5 * bendingForce.x)));
+    InterlockedAdd(hairNodeBuffer[currIndex + 1].ay, (int)(floatToInt * ( -springForce.y - 0.5 * bendingForce.y)));
+}
+
+
+#pragma kernel VelocityKernel
+[numthreads(32, 32, 1)]
+void VelocityKernel(uint3 id : SV_DispatchThreadID)
+{
+    // We do not count the last node in one hair.
+    if (id.x >= nHairs || id.y >= nNodesPerHair - 1)
+    {
+        return;
+    }
+
+    // find the nodes from the buffer
+    int currIndex = id.x * nNodesPerHair + id.y;
+    HairNode curr = hairNodeBuffer[currIndex];
+    HairNode next = hairNodeBuffer[currIndex + 1];
+
+    float2 relativePos = float2(next.x  - curr.x,  next.y  - curr.y);
+    float2 relativeVel = float2(next.vx - curr.vx, next.vy - curr.vy);
+
+    // decompose relative speed.
+    float2 tangentVel = dot(relativeVel, normalize(relativePos)) * normalize(relativePos);
+    float2 verticalVel = relativeVel - tangentVel;
+
+    // exchange velocity amount.
+    float2 exVel = 0.005 * tangentVel + 0.001 * verticalVel;
+
+    // update velocity: a = a + kv
+    InterlockedAdd(hairNodeBuffer[currIndex].ax,        (int)(floatToInt * exVel.x));
+    InterlockedAdd(hairNodeBuffer[currIndex].ay,        (int)(floatToInt * exVel.y));
+    InterlockedAdd(hairNodeBuffer[currIndex + 1].ax,   -(int)(floatToInt * exVel.x));
+    InterlockedAdd(hairNodeBuffer[currIndex + 1].ay,   -(int)(floatToInt * exVel.y));
+}
+
+#pragma kernel CollisionKernel
+[numthreads(32, 32, 1)]
+void CollisionKernel(uint3 id : SV_DispatchThreadID)
+{
+
+    if (id.x >= nHairs || id.y >= nNodesPerHair)
+    {
+        return;
+    }
+
+    int currIndex = id.x * nNodesPerHair + id.y;
+    HairNode curr = hairNodeBuffer[currIndex];
+
+    for (int i = 0; i < nColliders; i++)
+    {
+        float2 nodeToColliderCenter = float2(curr.x - colliderBuffer[i].x, curr.y - colliderBuffer[i].y);
+        if (length(nodeToColliderCenter) < colliderBuffer[i].r)
+        {
+            // move node outside the circle
+            float2 newPos = float2(colliderBuffer[i].x, colliderBuffer[i].y) + normalize(nodeToColliderCenter) * colliderBuffer[i].r;
+            hairNodeBuffer[currIndex].x = newPos.x;
+            hairNodeBuffer[currIndex].y = newPos.y;            
+
+            // exchange velocity between the collider and node
+            float dotProduct = dot(float2(curr.vx, curr.vy), normalize(nodeToColliderCenter));
+            if (dotProduct < 0)
+            {
+                float2 tangentVel = dotProduct * normalize(nodeToColliderCenter);
+                hairNodeBuffer[currIndex].vx -= tangentVel.x;
+                hairNodeBuffer[currIndex].vy -= tangentVel.y;
+
+                colliderBuffer[i].ax += 1000 * tangentVel.x;
+                colliderBuffer[i].ay += 1000 * tangentVel.y;
+            }
+        }
+    }
+}
+
+#pragma kernel EulerKernel
+[numthreads(32, 32, 1)]
+void EulerKernel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= nHairs || id.y >= nNodesPerHair)
+    {
+        return;
+    }
+
+    int currIndex = id.x * nNodesPerHair + id.y;
+    HairNode curr = hairNodeBuffer[currIndex];
+
+    // force the first row of nodes to be static
+    if (id.y == 0)
+    {
+        hairNodeBuffer[currIndex].x = nodeDistance * ((int)id.x - nHairs / 2);
+        hairNodeBuffer[currIndex].y = - nodeDistance * ((int)id.y - nNodesPerHair / 2);
+        hairNodeBuffer[currIndex].vx = 0;
+        hairNodeBuffer[currIndex].vy = 0;
+        hairNodeBuffer[currIndex].ax = 0;
+        hairNodeBuffer[currIndex].ay = 0;
+        return;
+    }
+
+    // Euler's method 
+    // v = v + a
+    hairNodeBuffer[currIndex].vx += dVelocity * intToFloat * curr.ax;
+    hairNodeBuffer[currIndex].vy += dVelocity * intToFloat * curr.ay;
+
+    // p = p + v
+    hairNodeBuffer[currIndex].x += dPosition * curr.vx;
+    hairNodeBuffer[currIndex].y += dPosition * curr.vy;
+
+    // To settle the nodes, we need to add friction.
+    // diminishing force 
+    hairNodeBuffer[currIndex].ax *= forceDecay;
+    hairNodeBuffer[currIndex].ay *= forceDecay;
+
+    // diminishing velocity
+    hairNodeBuffer[currIndex].vx *= velocityDecay;
+    hairNodeBuffer[currIndex].vy *= velocityDecay;
+}
